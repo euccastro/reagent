@@ -116,7 +116,12 @@
     ($! this :cljsInputDirty false)
     (let [rendered-value ($ this :cljsRenderedValue)
           dom-value ($ this :cljsDOMValue)
-          node (find-dom-node this)]
+          node (find-dom-node this) ;; Default to the root node within this component
+          node (if-let [input-selector ($ this :cljsSyntheticInputSelector)]
+                 ;; If this component is a synthetic input element with its own selector to locate a real
+                 ;; <input> node within its DOM tree, let's find that node using the given selector...
+                 (.querySelector node input-selector)
+                 node)]
       (when (not= rendered-value dom-value)
         (if-not (and (identical? node ($ js/document :activeElement))
                      (has-selection-api? ($ node :type))
@@ -170,26 +175,32 @@
     (batch/do-after-render #(input-set-value this)))
   (on-change e))
 
-(defn input-render-setup [this jsprops]
-  ;; Don't rely on React for updating "controlled inputs", since it
-  ;; doesn't play well with async rendering (misses keystrokes).
-  (when (and (some? jsprops)
-             (.hasOwnProperty jsprops "onChange")
-             (.hasOwnProperty jsprops "value"))
-    (assert find-dom-node
-            "reagent.dom needs to be loaded for controlled input to work")
-    (let [v ($ jsprops :value)
-          value (if (nil? v) "" v)
-          on-change ($ jsprops :onChange)]
-      (when-not ($ this :cljsInputLive)
-        ;; set initial value
-        ($! this :cljsInputLive true)
-        ($! this :cljsDOMValue value))
-      ($! this :cljsRenderedValue value)
-      (js-delete jsprops "value")
-      (doto jsprops
-        ($! :defaultValue value)
-        ($! :onChange #(input-handle-change this on-change %))))))
+(defn input-render-setup
+  ([this jsprops {:keys [synthetic-input-selector]}]
+   ;; Don't rely on React for updating "controlled inputs", since it
+   ;; doesn't play well with async rendering (misses keystrokes).
+   (when (and (some? jsprops)
+           (.hasOwnProperty jsprops "onChange")
+           (.hasOwnProperty jsprops "value"))
+     (assert find-dom-node
+       "reagent.dom needs to be loaded for controlled input to work")
+     (when synthetic-input-selector
+       ;; Pass along any synthetic input selector given
+       ($! this :cljsSyntheticInputSelector synthetic-input-selector))
+     (let [v ($ jsprops :value)
+           value (if (nil? v) "" v)
+           on-change ($ jsprops :onChange)]
+       (when-not ($ this :cljsInputLive)
+         ;; set initial value
+         ($! this :cljsInputLive true)
+         ($! this :cljsDOMValue value))
+       ($! this :cljsRenderedValue value)
+       (js-delete jsprops "value")
+       (doto jsprops
+         ($! :defaultValue value)
+         ($! :onChange #(input-handle-change this on-change %))))))
+  ([this jsprops]
+   (input-render-setup this jsprops {})))
 
 (defn input-unmount [this]
   ($! this :cljsInputLive nil))
@@ -200,6 +211,8 @@
     false))
 
 (def reagent-input-class nil)
+
+(def reagent-synthetic-input-class nil)
 
 (declare make-element)
 
@@ -213,10 +226,32 @@
        (input-render-setup this jsprops)
        (make-element argv comp jsprops first-child)))})
 
-(defn reagent-input []
-  (when (nil? reagent-input-class)
-    (set! reagent-input-class (comp/create-class input-spec)))
-  reagent-input-class)
+(def synthetic-input-spec
+  ;; Same as `input-spec` except it takes another argument for `input-selector`
+  {:display-name "ReagentSyntheticInput"
+   :component-did-update input-set-value
+   :component-will-unmount input-unmount
+   :reagent-render
+   (fn [input-selector argv comp jsprops first-child]
+     (let [this comp/*current-component*]
+       (input-render-setup this jsprops {:synthetic-input-selector input-selector})
+       (make-element argv comp jsprops first-child)))})
+
+
+(defn reagent-input
+  ([{:keys [synthetic-input?]}]
+   (if synthetic-input?
+     (do
+       (when (nil? reagent-input-class)
+         (set! reagent-synthetic-input-class (comp/create-class synthetic-input-spec)))
+       reagent-synthetic-input-class)
+     (do
+       (when (nil? reagent-input-class)
+         (set! reagent-input-class (comp/create-class input-spec)))
+       reagent-input-class)))
+  ([]
+   (reagent-input {})))
+  
 
 
 ;;; Conversion from Hiccup forms
@@ -253,11 +288,24 @@
       ($! jsprops :key key))
     ($ util/react createElement c jsprops)))
 
-(defn adapt-react-class [c]
-  (doto (NativeWrapper.)
-    ($! :name c)
-    ($! :id nil)
-    ($! :class nil)))
+(defn adapt-react-class
+  ([c {:keys [synthetic-input? input-selector]}]
+   (let [wrapped (doto (NativeWrapper.)
+                   ($! :name c)
+                   ($! :id nil)
+                   ($! :class nil))]
+     (if synthetic-input?
+       ;; This is a synthetic input component, i.e. it has a complex
+       ;; nesting of elements such that the root node is not necessarily
+       ;; the <input> tag we need to control, so we provide an affordance
+       ;; to configure a query selector to locate the right <input> within
+       ;; this component's rendered element subtree.
+       (doto wrapped
+         ($! :syntheticInput true)
+         ($! :syntheticInputSelector (or input-selector "input")))
+       wrapped)))
+  ([c]
+   (adapt-react-class c {})))
 
 (def tag-name-cache #js{})
 
@@ -269,13 +317,19 @@
 (declare as-element)
 
 (defn native-element [parsed argv first]
-  (let [comp ($ parsed :name)]
+  (let [comp ($ parsed :name)
+        synthetic-input? ($ parsed :syntheticInput)
+        synthetic-input-selector ($ parsed :syntheticInputSelector)]
     (let [props (nth argv first nil)
           hasprops (or (nil? props) (map? props))
           jsprops (convert-props (if hasprops props) parsed)
           first-child (+ first (if hasprops 1 0))]
-      (if (input-component? comp)
-        (-> [(reagent-input) argv comp jsprops first-child]
+      (if (or synthetic-input? (input-component? comp))
+        (-> (if synthetic-input?
+              ;; If we are dealing with a synthetic input, use the synthetic-input-spec form:
+              [(reagent-input {:synthetic-input? true}) synthetic-input-selector argv comp jsprops first-child]
+              ;; Else use the regular input-spec form:
+              [(reagent-input) argv comp jsprops first-child])
             (with-meta (meta argv))
             as-element)
         (let [key (-> (meta argv) get-key)
