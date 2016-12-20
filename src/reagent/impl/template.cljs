@@ -242,7 +242,7 @@
   ([{:keys [synthetic-input?]}]
    (if synthetic-input?
      (do
-       (when (nil? reagent-input-class)
+       (when (nil? reagent-synthetic-input-class)
          (set! reagent-synthetic-input-class (comp/create-class synthetic-input-spec)))
        reagent-synthetic-input-class)
      (do
