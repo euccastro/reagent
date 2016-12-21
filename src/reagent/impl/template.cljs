@@ -111,60 +111,68 @@
   [input-type]
   (contains? these-inputs-have-selection-api input-type))
 
-(defn input-set-value [this]
+(declare input-component-set-value)
+
+(defn input-node-set-value
+  [node rendered-value dom-value component {:keys [on-write]}]
+  (if-not (and (identical? node ($ js/document :activeElement))
+            (has-selection-api? ($ node :type))
+            (string? rendered-value)
+            (string? dom-value))
+    ;; just set the value, no need to worry about a cursor
+    (do
+      ($! component :cljsDOMValue rendered-value)
+      ($! node :value rendered-value)
+      (when (fn? on-write)
+        (on-write rendered-value)))
+    
+    ;; Setting "value" (below) moves the cursor position to the
+    ;; end which gives the user a jarring experience.
+    ;;
+    ;; But repositioning the cursor within the text, turns out to
+    ;; be quite a challenge because changes in the text can be
+    ;; triggered by various events like:
+    ;; - a validation function rejecting a user inputted char
+    ;; - the user enters a lower case char, but is transformed to
+    ;;   upper.
+    ;; - the user selects multiple chars and deletes text
+    ;; - the user pastes in multiple chars, and some of them are
+    ;;   rejected by a validator.
+    ;; - the user selects multiple chars and then types in a
+    ;;   single new char to repalce them all.
+    ;; Coming up with a sane cursor repositioning strategy hasn't
+    ;; been easy ALTHOUGH in the end, it kinda fell out nicely,
+    ;; and it appears to sanely handle all the cases we could
+    ;; think of.
+    ;; So this is just a warning. The code below is simple
+    ;; enough, but if you are tempted to change it, be aware of
+    ;; all the scenarios you have handle.
+    (let [node-value ($ node :value)]
+      (if (not= node-value dom-value)
+        ;; IE has not notified us of the change yet, so check again later
+        (batch/do-after-render #(input-component-set-value component))
+        (let [existing-offset-from-end (- (count node-value)
+                                         ($ node :selectionStart))
+              new-cursor-offset        (- (count rendered-value)
+                                         existing-offset-from-end)]
+          ($! component :cljsDOMValue rendered-value)
+          ($! node :value rendered-value)
+          (when (fn? on-write)
+            (on-write rendered-value))
+          ($! node :selectionStart new-cursor-offset)
+          ($! node :selectionEnd new-cursor-offset))))))
+
+(defn input-component-set-value [this]
   (when ($ this :cljsInputLive)
     ($! this :cljsInputDirty false)
     (let [rendered-value ($ this :cljsRenderedValue)
           dom-value ($ this :cljsDOMValue)
           node (find-dom-node this) ;; Default to the root node within this component
-          node (if-let [input-selector ($ this :cljsSyntheticInputSelector)]
-                 ;; If this component is a synthetic input element with its own selector to locate a real
-                 ;; <input> node within its DOM tree, let's find that node using the given selector...
-                 (.querySelector node input-selector)
-                 node)]
+          synthetic-input-setter ($ this :cljsSyntheticInputSetter)]
       (when (not= rendered-value dom-value)
-        (if-not (and (identical? node ($ js/document :activeElement))
-                     (has-selection-api? ($ node :type))
-                     (string? rendered-value)
-                     (string? dom-value))
-          ;; just set the value, no need to worry about a cursor
-          (do
-            ($! this :cljsDOMValue rendered-value)
-            ($! node :value rendered-value))
-
-          ;; Setting "value" (below) moves the cursor position to the
-          ;; end which gives the user a jarring experience.
-          ;;
-          ;; But repositioning the cursor within the text, turns out to
-          ;; be quite a challenge because changes in the text can be
-          ;; triggered by various events like:
-          ;; - a validation function rejecting a user inputted char
-          ;; - the user enters a lower case char, but is transformed to
-          ;;   upper.
-          ;; - the user selects multiple chars and deletes text
-          ;; - the user pastes in multiple chars, and some of them are
-          ;;   rejected by a validator.
-          ;; - the user selects multiple chars and then types in a
-          ;;   single new char to repalce them all.
-          ;; Coming up with a sane cursor repositioning strategy hasn't
-          ;; been easy ALTHOUGH in the end, it kinda fell out nicely,
-          ;; and it appears to sanely handle all the cases we could
-          ;; think of.
-          ;; So this is just a warning. The code below is simple
-          ;; enough, but if you are tempted to change it, be aware of
-          ;; all the scenarios you have handle.
-          (let [node-value ($ node :value)]
-            (if (not= node-value dom-value)
-              ;; IE has not notified us of the change yet, so check again later
-              (batch/do-after-render #(input-set-value this))
-              (let [existing-offset-from-end (- (count node-value)
-                                                ($ node :selectionStart))
-                    new-cursor-offset        (- (count rendered-value)
-                                                existing-offset-from-end)]
-                ($! this :cljsDOMValue rendered-value)
-                ($! node :value rendered-value)
-                ($! node :selectionStart new-cursor-offset)
-                ($! node :selectionEnd new-cursor-offset)))))))))
+        (if (fn? synthetic-input-setter)
+          (synthetic-input-setter input-node-set-value node rendered-value dom-value this)
+          (input-node-set-value node rendered-value dom-value this {}))))))
 
 (defn input-handle-change [this on-change e]
   ($! this :cljsDOMValue (-> e .-target .-value))
@@ -172,11 +180,11 @@
   ;; wants to keep the value unchanged
   (when-not ($ this :cljsInputDirty)
     ($! this :cljsInputDirty true)
-    (batch/do-after-render #(input-set-value this)))
+    (batch/do-after-render #(input-component-set-value this)))
   (on-change e))
 
 (defn input-render-setup
-  ([this jsprops {:keys [synthetic-input-selector]}]
+  ([this jsprops {:keys [synthetic-input-setter]}]
    ;; Don't rely on React for updating "controlled inputs", since it
    ;; doesn't play well with async rendering (misses keystrokes).
    (when (and (some? jsprops)
@@ -184,9 +192,9 @@
            (.hasOwnProperty jsprops "value"))
      (assert find-dom-node
        "reagent.dom needs to be loaded for controlled input to work")
-     (when synthetic-input-selector
-       ;; Pass along any synthetic input selector given
-       ($! this :cljsSyntheticInputSelector synthetic-input-selector))
+     (when synthetic-input-setter
+       ;; Pass along any synthetic input setter given
+       ($! this :cljsSyntheticInputSetter synthetic-input-setter))
      (let [v ($ jsprops :value)
            value (if (nil? v) "" v)
            on-change ($ jsprops :onChange)]
@@ -218,7 +226,7 @@
 
 (def input-spec
   {:display-name "ReagentInput"
-   :component-did-update input-set-value
+   :component-did-update input-component-set-value
    :component-will-unmount input-unmount
    :reagent-render
    (fn [argv comp jsprops first-child]
@@ -227,31 +235,28 @@
        (make-element argv comp jsprops first-child)))})
 
 (def synthetic-input-spec
-  ;; Same as `input-spec` except it takes another argument for `input-selector`
+  ;; Same as `input-spec` except it takes another argument for `input-setter`
   {:display-name "ReagentSyntheticInput"
-   :component-did-update input-set-value
+   :component-did-update input-component-set-value
    :component-will-unmount input-unmount
    :reagent-render
-   (fn [input-selector argv comp jsprops first-child]
+   (fn [input-setter argv comp jsprops first-child]
      (let [this comp/*current-component*]
-       (input-render-setup this jsprops {:synthetic-input-selector input-selector})
+       (input-render-setup this jsprops {:synthetic-input-setter input-setter})
        (make-element argv comp jsprops first-child)))})
 
 
 (defn reagent-input
-  ([{:keys [synthetic-input?]}]
-   (if synthetic-input?
-     (do
-       (when (nil? reagent-synthetic-input-class)
-         (set! reagent-synthetic-input-class (comp/create-class synthetic-input-spec)))
-       reagent-synthetic-input-class)
-     (do
-       (when (nil? reagent-input-class)
-         (set! reagent-input-class (comp/create-class input-spec)))
-       reagent-input-class)))
-  ([]
-   (reagent-input {})))
-  
+  []
+  (when (nil? reagent-input-class)
+    (set! reagent-input-class (comp/create-class input-spec)))
+  reagent-input-class)
+
+(defn reagent-synthetic-input
+  []
+  (when (nil? reagent-synthetic-input-class)
+    (set! reagent-synthetic-input-class (comp/create-class synthetic-input-spec)))
+  reagent-synthetic-input-class)
 
 
 ;;; Conversion from Hiccup forms
@@ -289,20 +294,21 @@
     ($ util/react createElement c jsprops)))
 
 (defn adapt-react-class
-  ([c {:keys [synthetic-input? input-selector]}]
+  ([c {:keys [synthetic-input-setter]}]
    (let [wrapped (doto (NativeWrapper.)
                    ($! :name c)
                    ($! :id nil)
                    ($! :class nil))]
-     (if synthetic-input?
+     (if (fn? synthetic-input-setter)
        ;; This is a synthetic input component, i.e. it has a complex
        ;; nesting of elements such that the root node is not necessarily
-       ;; the <input> tag we need to control, so we provide an affordance
-       ;; to configure a query selector to locate the right <input> within
-       ;; this component's rendered element subtree.
+       ;; the <input> tag we need to control, and/or it needs to execute
+       ;; custom code when updated values are written so we provide an affordance
+       ;; to configure a setter fn that can choose a different DOM node
+       ;; than the root node if it wants, and can supply a function hooked
+       ;; to value updates so it can maintain its own component state as needed.
        (doto wrapped
-         ($! :syntheticInput true)
-         ($! :syntheticInputSelector (or input-selector "input")))
+         ($! :syntheticInputSetter synthetic-input-setter))
        wrapped)))
   ([c]
    (adapt-react-class c {})))
@@ -318,16 +324,15 @@
 
 (defn native-element [parsed argv first]
   (let [comp ($ parsed :name)
-        synthetic-input? ($ parsed :syntheticInput)
-        synthetic-input-selector ($ parsed :syntheticInputSelector)]
+        synthetic-input-setter ($ parsed :syntheticInputSetter)]
     (let [props (nth argv first nil)
           hasprops (or (nil? props) (map? props))
           jsprops (convert-props (if hasprops props) parsed)
           first-child (+ first (if hasprops 1 0))]
-      (if (or synthetic-input? (input-component? comp))
-        (-> (if synthetic-input?
+      (if (or (fn? synthetic-input-setter) (input-component? comp))
+        (-> (if (fn? synthetic-input-setter)
               ;; If we are dealing with a synthetic input, use the synthetic-input-spec form:
-              [(reagent-input {:synthetic-input? true}) synthetic-input-selector argv comp jsprops first-child]
+              [(reagent-synthetic-input) synthetic-input-setter argv comp jsprops first-child]
               ;; Else use the regular input-spec form:
               [(reagent-input) argv comp jsprops first-child])
             (with-meta (meta argv))
