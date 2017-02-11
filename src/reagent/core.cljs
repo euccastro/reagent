@@ -48,9 +48,9 @@
 (defn adapt-react-class
   "Returns an adapter for a native React class, that may be used
   just like a Reagent component function or class in Hiccup forms."
-  [c]
+  [c & [opts]]
   (assert c)
-  (tmpl/adapt-react-class c))
+  (tmpl/adapt-react-class c opts))
 
 (defn reactify-component
   "Returns an adapter for a Reagent component, that may be used from
